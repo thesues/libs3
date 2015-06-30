@@ -29,6 +29,7 @@
  * calls to libs3 functions, and prints the results.
  **/
 
+#define _XOPEN_SOURCE 500
 #include <ctype.h>
 #include <getopt.h>
 #include <stdio.h>
@@ -364,9 +365,25 @@ typedef struct growbuffer
 } growbuffer;
 
 
+
+static void growbuffer_display(growbuffer *gb) {
+
+	int size = gb->size;
+	if (size < (64 * 1024)) {
+		gb->data[size] = 0;
+		printf("%s", gb->data);
+	} else {
+		printf("%.*s",size,gb->data);
+		if(gb->next)
+			growbuffer_display(gb->next);
+	}
+
+}
+
 // returns nonzero on success, zero on out of memory
 static int growbuffer_append(growbuffer **gb, const char *data, int dataLen)
 {
+    int toCopy = 0 ;
     while (dataLen) {
         growbuffer *buf = *gb ? (*gb)->prev : 0;
         if (!buf || (buf->size == sizeof(buf->data))) {
@@ -388,7 +405,7 @@ static int growbuffer_append(growbuffer **gb, const char *data, int dataLen)
             }
         }
 
-        int toCopy = (sizeof(buf->data) - buf->size);
+        toCopy = (sizeof(buf->data) - buf->size);
         if (toCopy > dataLen) {
             toCopy = dataLen;
         }
@@ -398,7 +415,7 @@ static int growbuffer_append(growbuffer **gb, const char *data, int dataLen)
         buf->size += toCopy, data += toCopy, dataLen -= toCopy;
     }
 
-    return 1;
+    return toCopy;
 }
 
 
@@ -1191,6 +1208,12 @@ static S3Status listBucketCallback(int isTruncated, const char *nextMarker,
 }
 
 
+
+
+
+
+
+
 static void list_bucket(const char *bucketName, const char *prefix,
                         const char *marker, const char *delimiter,
                         int maxkeys, int allDetails)
@@ -1383,7 +1406,7 @@ static int putObjectDataCallback(int bufferSize, char *buffer,
         // value properly when it's in the same call, so print separately
         printf("%llu bytes remaining ", 
                (unsigned long long) data->contentLength);
-        printf("(%d%% complete) ...\n",
+        printf("(%d%% complete) ...\r",
                (int) (((data->originalContentLength - 
                         data->contentLength) * 100) /
                       data->originalContentLength));
@@ -2651,6 +2674,350 @@ void set_logging(int argc, char **argv, int optindex)
 }
 
 
+typedef struct UploadManager{
+    //used for initial multipart
+    char * upload_id;
+
+    //used for upload part object
+    char **etags;
+    int next_etags_pos;
+
+    //used for commit Upload
+    growbuffer *gb;
+    int remaining;
+} UploadManager;    
+
+typedef struct MultipartPartData {
+    put_object_callback_data put_object_data;
+    int seq;
+    UploadManager * manager;
+} MultipartPartData;
+
+
+S3Status initial_multipart_callback(const char * upload_id, void * callbackData) {
+    UploadManager *manager = (UploadManager *) callbackData;
+    manager->upload_id = strdup(upload_id);
+    return S3StatusOK;
+}
+
+S3Status MultipartResponseProperiesCallback(const S3ResponseProperties *properties, void *callbackData) {
+
+    responsePropertiesCallback(properties, callbackData);
+    MultipartPartData * data = (MultipartPartData*) callbackData;
+    int seq = data->seq;
+    const char *etag = properties->eTag;
+    data->manager->etags[seq - 1] = strdup(etag);
+    data->manager->next_etags_pos = seq;
+    return S3StatusOK;
+}
+
+static int multipartPutXmlCallback(int bufferSize, char *buffer, void *callbackData) {
+        UploadManager * manager = (UploadManager*)callbackData;
+        int ret = 0;
+        if (manager->remaining) {
+                int toRead = ((manager->remaining > bufferSize) ?
+                              bufferSize : manager->remaining);
+                    growbuffer_read(&(manager->gb), toRead, &ret, buffer);
+        }
+        manager->remaining -= ret;
+        return ret;
+}
+
+#define MULTIPART_CHUNK_SIZE (15<<20) //multipart is 15M
+
+static void put_object_multipart(int argc, char **argv, int optindex)
+{
+    if (optindex == argc) {
+        fprintf(stderr, "\nERROR: Missing parameter: bucket/key\n");
+        usageExit(stderr);
+    }
+
+    // Split bucket/key
+    char *slash = argv[optindex];
+    while (*slash && (*slash != '/')) {
+        slash++;
+    }
+    if (!*slash || !*(slash + 1)) { fprintf(stderr, "\nERROR: Invalid bucket/key name: %s\n",
+                argv[optindex]);
+        usageExit(stderr);
+    }
+    *slash++ = 0;
+
+    const char *bucketName = argv[optindex++];
+    const char *key = slash;
+
+    const char *filename = 0;
+    uint64_t contentLength = 0;
+    const char *cacheControl = 0, *contentType = 0, *md5 = 0;
+    const char *contentDispositionFilename = 0, *contentEncoding = 0;
+    int64_t expires = -1;
+    S3CannedAcl cannedAcl = S3CannedAclPrivate;
+    int metaPropertiesCount = 0;
+    S3NameValue metaProperties[S3_MAX_METADATA_COUNT];
+    int noStatus = 0;
+
+    while (optindex < argc) {
+        char *param = argv[optindex++];
+        if (!strncmp(param, FILENAME_PREFIX, FILENAME_PREFIX_LEN)) {
+            filename = &(param[FILENAME_PREFIX_LEN]);
+        }
+        else if (!strncmp(param, CONTENT_LENGTH_PREFIX, 
+                          CONTENT_LENGTH_PREFIX_LEN)) {
+            contentLength = convertInt(&(param[CONTENT_LENGTH_PREFIX_LEN]),
+                                       "contentLength");
+            if (contentLength > (5LL * 1024 * 1024 * 1024)) {
+                fprintf(stderr, "\nERROR: contentLength must be no greater "
+                        "than 5 GB\n");
+                usageExit(stderr);
+            }
+        }
+        else if (!strncmp(param, CACHE_CONTROL_PREFIX, 
+                          CACHE_CONTROL_PREFIX_LEN)) {
+            cacheControl = &(param[CACHE_CONTROL_PREFIX_LEN]);
+        }
+        else if (!strncmp(param, CONTENT_TYPE_PREFIX, 
+                          CONTENT_TYPE_PREFIX_LEN)) {
+            contentType = &(param[CONTENT_TYPE_PREFIX_LEN]);
+        }
+        else if (!strncmp(param, MD5_PREFIX, MD5_PREFIX_LEN)) {
+            md5 = &(param[MD5_PREFIX_LEN]);
+        }
+        else if (!strncmp(param, CONTENT_DISPOSITION_FILENAME_PREFIX, 
+                          CONTENT_DISPOSITION_FILENAME_PREFIX_LEN)) {
+            contentDispositionFilename = 
+                &(param[CONTENT_DISPOSITION_FILENAME_PREFIX_LEN]);
+        }
+        else if (!strncmp(param, CONTENT_ENCODING_PREFIX, 
+                          CONTENT_ENCODING_PREFIX_LEN)) {
+            contentEncoding = &(param[CONTENT_ENCODING_PREFIX_LEN]);
+        }
+        else if (!strncmp(param, EXPIRES_PREFIX, EXPIRES_PREFIX_LEN)) {
+            expires = parseIso8601Time(&(param[EXPIRES_PREFIX_LEN]));
+            if (expires < 0) {
+                fprintf(stderr, "\nERROR: Invalid expires time "
+                        "value; ISO 8601 time format required\n");
+                usageExit(stderr);
+            }
+        }
+        else if (!strncmp(param, X_AMZ_META_PREFIX, X_AMZ_META_PREFIX_LEN)) {
+            if (metaPropertiesCount == S3_MAX_METADATA_COUNT) {
+                fprintf(stderr, "\nERROR: Too many x-amz-meta- properties, "
+                        "limit %lu: %s\n", 
+                        (unsigned long) S3_MAX_METADATA_COUNT, param);
+                usageExit(stderr);
+            }
+            char *name = &(param[X_AMZ_META_PREFIX_LEN]);
+            char *value = name;
+            while (*value && (*value != '=')) {
+                value++;
+            }
+            if (!*value || !*(value + 1)) {
+                fprintf(stderr, "\nERROR: Invalid parameter: %s\n", param);
+                usageExit(stderr);
+            }
+            *value++ = 0;
+            metaProperties[metaPropertiesCount].name = name;
+            metaProperties[metaPropertiesCount++].value = value;
+        }
+        else if (!strncmp(param, CANNED_ACL_PREFIX, CANNED_ACL_PREFIX_LEN)) {
+            char *val = &(param[CANNED_ACL_PREFIX_LEN]);
+            if (!strcmp(val, "private")) {
+                cannedAcl = S3CannedAclPrivate;
+            }
+            else if (!strcmp(val, "public-read")) {
+                cannedAcl = S3CannedAclPublicRead;
+            }
+            else if (!strcmp(val, "public-read-write")) {
+                cannedAcl = S3CannedAclPublicReadWrite;
+            }
+            else if (!strcmp(val, "authenticated-read")) {
+                cannedAcl = S3CannedAclAuthenticatedRead;
+            }
+            else {
+                fprintf(stderr, "\nERROR: Unknown canned ACL: %s\n", val);
+                usageExit(stderr);
+            }
+        }
+        else if (!strncmp(param, NO_STATUS_PREFIX, NO_STATUS_PREFIX_LEN)) {
+            const char *ns = &(param[NO_STATUS_PREFIX_LEN]);
+            if (!strcmp(ns, "true") || !strcmp(ns, "TRUE") || 
+                !strcmp(ns, "yes") || !strcmp(ns, "YES") ||
+                !strcmp(ns, "1")) {
+                noStatus = 1;
+            }
+        }
+        else {
+            fprintf(stderr, "\nERROR: Unknown param: %s\n", param);
+            usageExit(stderr);
+        }
+    }
+
+    put_object_callback_data data;
+
+    data.infile = 0;
+    data.gb = 0;
+    data.noStatus = noStatus;
+
+    if (filename) {
+        if (!contentLength) {
+            struct stat statbuf;
+            // Stat the file to get its length
+            if (stat(filename, &statbuf) == -1) {
+                fprintf(stderr, "\nERROR: Failed to stat file %s: ",
+                        filename);
+                perror(0);
+                exit(-1);
+            }
+            contentLength = statbuf.st_size;
+        }
+        // Open the file
+        if (!(data.infile = fopen(filename, "r" FOPEN_EXTRA_FLAGS))) {
+            fprintf(stderr, "\nERROR: Failed to open input file %s: ",
+                    filename);
+            perror(0);
+            exit(-1);
+        }
+    }
+    else {
+            fprintf(stderr, "\nERROR: Failed to open file");
+            perror(0);
+            exit(-1);
+    }
+
+    data.contentLength = data.originalContentLength = contentLength;
+
+    S3_init();
+    
+    S3BucketContext bucketContext =
+    {
+        0,
+        bucketName,
+        protocolG,
+        uriStyleG,
+        accessKeyIdG,
+        secretAccessKeyG
+    };
+
+    S3PutProperties putProperties =
+    {
+        contentType,
+        md5,
+        cacheControl,
+        contentDispositionFilename,
+        contentEncoding,
+        expires,
+        cannedAcl,
+        metaPropertiesCount,
+        metaProperties
+    };
+
+    S3PutObjectHandler putObjectHandler = 
+    {
+	    {&MultipartResponseProperiesCallback, &responseCompleteCallback },
+	    &putObjectDataCallback
+    };
+
+    UploadManager manager;
+
+    manager.upload_id = 0;
+    manager.gb = 0;
+
+    //div round up
+    int seq;
+    int totalSeq = (contentLength + MULTIPART_CHUNK_SIZE- 1)/ MULTIPART_CHUNK_SIZE;
+
+    MultipartPartData partData;
+    int partContentLength = 0;
+
+    manager.etags = (char**)malloc(sizeof(char*) * totalSeq);
+    manager.next_etags_pos = 0;
+
+    S3MultipartInitialHander handler =
+    {
+        {
+            &responsePropertiesCallback,
+            &responseCompleteCallback
+        },
+        &initial_multipart_callback    
+    };
+
+
+    do {
+        S3_multipart_initial(&bucketContext,key,0, &handler,0, &manager);
+    } while (S3_status_is_retryable(statusG) && should_retry());
+    if (manager.upload_id == 0 || statusG != S3StatusOK) {
+	    printError();
+	    goto clean;
+    }
+
+    for(seq = 1 ; seq <= totalSeq ; seq ++) {
+	    memset(&partData, 0, sizeof(MultipartPartData));
+	    partData.manager = &manager;
+	    partData.seq = seq;
+	    partData.put_object_data = data;
+	    partContentLength = (contentLength > MULTIPART_CHUNK_SIZE)?MULTIPART_CHUNK_SIZE:contentLength;
+	    printf("Sending Part Seq %d, length=%d\n", seq, partContentLength);
+	    partData.put_object_data.contentLength = partContentLength;
+	    //if putProperties.md5 is not NULL, ignore it
+	    putProperties.md5 = 0;
+	    do {
+	        S3_multipart_upload_part(&bucketContext, key, &putProperties, &putObjectHandler, seq, manager.upload_id, partContentLength,0, &partData);
+	    } while (S3_status_is_retryable(statusG) && should_retry());
+	    if (statusG != S3StatusOK) {
+		    printError();
+		    goto clean;
+	    }
+	    contentLength -= MULTIPART_CHUNK_SIZE;
+    }
+
+    
+    int i;
+
+    S3MultipartCommitHandler commit_handler = {
+            {
+                    &responsePropertiesCallback,&responseCompleteCallback
+            },
+            &multipartPutXmlCallback,
+            0
+    };
+
+    int size = 0;
+    size += growbuffer_append(&(manager.gb), "<CompleteMultipartUpload>", strlen("<CompleteMultipartUpload>"));
+    char buf[256];
+    int n;
+    for(i=0;i<totalSeq;i++) {
+            n = snprintf(buf,256,"<Part><PartNumber>%d</PartNumber><ETag>%s</ETag></Part>",
+                            i + 1,manager.etags[i]);
+            size += growbuffer_append(&(manager.gb), buf, n);
+    }
+    size += growbuffer_append(&(manager.gb), "</CompleteMultipartUpload>",strlen("</CompleteMultipartUpload>"));
+
+    printf("size:%d", size);
+    growbuffer_display(manager.gb);
+    manager.remaining = size;
+
+    do {
+	    S3_multipart_commit(&bucketContext, key, &commit_handler, manager.upload_id, manager.remaining, 0,  &manager); 
+    } while (S3_status_is_retryable(statusG) && should_retry());
+    if (statusG != S3StatusOK) {
+	    printError();
+	    goto clean;
+    }
+
+
+
+clean:
+    if(manager.upload_id)
+	    free(manager.upload_id);
+    for(i=0;i<manager.next_etags_pos;i++) {
+	    free(manager.etags[i]);
+    }
+    growbuffer_destroy(manager.gb);
+    free(manager.etags);
+    S3_deinitialize();
+}
+
+
 // main ----------------------------------------------------------------------
 
 int main(int argc, char **argv)
@@ -2750,6 +3117,9 @@ int main(int argc, char **argv)
         else {
             delete_bucket(argc, argv, optind);
         }
+    }
+    else if (!strcmp(command, "mput")) {
+	put_object_multipart(argc, argv, optind);
     }
     else if (!strcmp(command, "put")) {
         put_object(argc, argv, optind);

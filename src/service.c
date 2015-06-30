@@ -187,5 +187,3 @@ void S3_list_service(S3Protocol protocol, const char *accessKeyId,
     // Perform the request
     request_perform(&params, requestContext);
 }
-
-
